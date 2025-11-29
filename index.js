@@ -7,11 +7,25 @@ const OpenAI = require('openai');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const session = require('express-session');
+const multer = require('multer');
+const ragService = require('./rag');
 require('dotenv').config();
+
+// Multer config for memory storage
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Initialize OpenAI
+let openai;
+if (process.env.OPENAI_API_KEY) {
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+}
+
+// Initialize RAG Service
+ragService.init();
 
 app.use((req, res, next) => {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
@@ -73,7 +87,7 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     passport.use(new GoogleStrategy({
         clientID: process.env.GOOGLE_CLIENT_ID,
         clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-        callbackURL: "http://localhost:3000/api/auth/google/callback"
+        callbackURL: process.env.GOOGLE_CALLBACK
     },
         async function (accessToken, refreshToken, profile, cb) {
             try {
@@ -256,6 +270,89 @@ app.put('/api/users/:id/password', authenticateToken, isAdmin, async (req, res) 
     }
 });
 
+// Document Routes (RAG)
+app.post('/api/documents', authenticateToken, upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).send('No file uploaded');
+        }
+
+        // Sanitize filename to ASCII only for compatibility
+        const originalName = req.file.originalname;
+        const sanitizedFilename = originalName.replace(/[^\x00-\x7F]/g, "_");
+
+        console.log(`Uploading document: ${sanitizedFilename} (Original: ${originalName})`);
+
+        const result = await ragService.processDocument(req.file.buffer, sanitizedFilename, req.user.id);
+        
+        await db.collection('documents').add({
+            user_id: req.user.id,
+            filename: sanitizedFilename, // Store sanitized name
+            original_filename: originalName, // Store original name for display if needed
+            chunk_count: result.chunks,
+            uploaded_at: new Date().toISOString()
+        });
+
+        res.json({ message: 'Document processed', chunks: result.chunks });
+    } catch (e) {
+        console.error('Error processing document:', e);
+        res.status(500).send('Error processing document: ' + e.message);
+    }
+});
+
+app.get('/api/documents', authenticateToken, async (req, res) => {
+    try {
+        const snapshot = await db.collection('documents')
+            .where('user_id', '==', req.user.id)
+            .orderBy('uploaded_at', 'desc')
+            .get();
+        const documents = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        res.json(documents);
+    } catch (e) {
+        // Handle missing index error
+        if (e.code === 9 || e.message.includes('requires an index')) {
+            console.warn('⚠️ Firestore index missing for documents. Falling back to client-side sorting.');
+            try {
+                const snapshot = await db.collection('documents')
+                    .where('user_id', '==', req.user.id)
+                    .get();
+                const documents = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // Sort in memory
+                documents.sort((a, b) => new Date(b.uploaded_at) - new Date(a.uploaded_at));
+                return res.json(documents);
+            } catch (retryErr) {
+                console.error('Retry failed:', retryErr);
+            }
+        }
+
+        console.error('Error fetching documents:', e);
+        res.status(500).send('Error fetching documents');
+    }
+});
+
+app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
+    try {
+        const docRef = db.collection('documents').doc(req.params.id);
+        const doc = await docRef.get();
+        
+        if (!doc.exists || doc.data().user_id !== req.user.id) {
+            return res.status(404).send('Document not found');
+        }
+
+        const filename = doc.data().filename;
+        
+        // Delete from Pinecone
+        await ragService.deleteDocument(filename, req.user.id);
+        
+        // Delete from Firestore
+        await docRef.delete();
+        
+        res.send('Document deleted');
+    } catch (e) {
+        console.error('Error deleting document:', e);
+        res.status(500).send('Error deleting document');
+    }
+});
 
 // Chat Routes
 app.get('/api/threads', authenticateToken, async (req, res) => {
@@ -391,8 +488,35 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                 const historySnapshot = await threadRef.collection('messages').orderBy('timestamp', 'asc').get();
                 const history = historySnapshot.docs.map(d => d.data());
 
+                // RAG: Query Context
+                let systemPrompt = 'You are a helpful assistant.';
+                try {
+                    console.log(`DEBUG: Querying RAG for user ${req.user.id} with content: "${content}"`);
+                    const context = await ragService.queryContext(content, req.user.id);
+                    console.log('DEBUG: RAG Context result length:', context ? context.length : 0);
+                    if (context) {
+                        systemPrompt = `You are a strict assistant that answers questions ONLY based on the provided context. 
+                                        Do NOT use your outside knowledge. 
+                                        If the answer is not found in the context below, simply state: "No he encontrado esa información en tus documentos."
+                                        Do not apologize or provide alternative information.
+
+                                        Context from uploaded documents:
+                                        ${context}`;
+                        console.log('DEBUG: RAG Context injected into system prompt');
+                    } else {
+                        console.log('DEBUG: No relevant context found');
+                    }
+                } catch (ragError) {
+                    console.error('DEBUG: RAG Error:', ragError);
+                }
+
+                const messages = [
+                    { role: 'system', content: systemPrompt },
+                    ...history.map(m => ({ role: m.role, content: m.content }))
+                ];
+
                 const completion = await openai.chat.completions.create({
-                    messages: history.map(m => ({ role: m.role, content: m.content })),
+                    messages: messages,
                     model: process.env.OPENAI_MODEL,
                 });
                 aiContent = completion.choices[0].message.content;
