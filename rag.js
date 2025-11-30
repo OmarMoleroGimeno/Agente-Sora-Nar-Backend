@@ -57,19 +57,19 @@ const ragService = {
         }
 
         console.log(`Processing document: ${fileName} for user: ${userId}`);
-        
+
         try {
             // 1. Extract Text
             console.log('DEBUG: Starting PDF parsing...');
             const data = await pdf(fileBuffer);
             const text = data.text;
             console.log(`DEBUG: Extracted text length: ${text.length}`);
-            
+
             if (!text || text.trim().length < 50) {
                 console.warn('⚠️ Extracted text is too short. Likely a scanned PDF or empty file.');
                 throw new Error('Could not extract text from document. If this is a scanned PDF (images), it is not supported yet.');
             }
-            
+
             // 2. Chunk Text
             const chunks = chunkText(text);
             console.log(`Generated ${chunks.length} chunks`);
@@ -80,7 +80,7 @@ const ragService = {
             for (let i = 0; i < chunks.length; i++) {
                 const chunk = chunks[i];
                 const embedding = await embedText(chunk);
-                
+
                 vectors.push({
                     id: require('crypto').randomUUID(),
                     values: embedding,
@@ -102,8 +102,11 @@ const ragService = {
                 await pineconeIndex.upsert(batch);
             }
             console.log('DEBUG: Upsert complete');
-            
-            return { chunks: chunks.length };
+
+            return {
+                chunks: chunks.length,
+                vectorIds: vectors.map(v => v.id)
+            };
         } catch (error) {
             console.error('❌ Error in processDocument:', error);
             throw error;
@@ -118,7 +121,7 @@ const ragService = {
             const embedding = await embedText(query);
 
             // 2. Query Pinecone
-            console.log('DEBUG: Querying Pinecone...');
+            console.log(`DEBUG: Querying Pinecone for user: ${userId}`);
             const queryResponse = await pineconeIndex.query({
                 vector: embedding,
                 topK: 3,
@@ -126,7 +129,15 @@ const ragService = {
                 includeMetadata: true
             });
             console.log('DEBUG: Pinecone matches:', queryResponse.matches.length);
-            
+
+            if (queryResponse.matches.length > 0) {
+                console.log('DEBUG: Match Metadata:', queryResponse.matches.map(m => ({
+                    fileName: m.metadata.fileName,
+                    score: m.score,
+                    textPreview: m.metadata.text.substring(0, 50) + '...'
+                })));
+            }
+
             // 3. Extract Text
             return queryResponse.matches.map(match => match.metadata.text).join('\n\n');
         } catch (error) {
@@ -134,23 +145,32 @@ const ragService = {
             return ''; // Return empty context on error to avoid breaking chat
         }
     },
-    
-    async deleteDocument(fileName, userId) {
-         if (!pineconeIndex) return;
-         try {
-             console.log(`DEBUG: Deleting vectors for file: ${fileName}`);
-             await pineconeIndex.deleteMany({
-                 filter: {
-                     userId: userId,
-                     fileName: fileName
-                 }
-             });
-             console.log('DEBUG: Vectors deleted successfully');
-         } catch (e) {
-             console.error('⚠️ Error deleting vectors from Pinecone (proceeding with Firestore delete):', e.message);
-             // We swallow the error here to allow Firestore deletion to proceed
-             // This is important for cleaning up "corrupted" documents where Pinecone metadata might be invalid
-         }
+
+    async deleteDocument(vectorIds) {
+        if (!pineconeIndex) return;
+        if (!vectorIds || vectorIds.length === 0) {
+            console.warn('⚠️ No vector IDs provided for deletion.');
+            return;
+        }
+
+        try {
+            console.log(`DEBUG: Deleting ${vectorIds.length} vectors by ID...`);
+            // Pinecone v6+ expects an array of strings for deleteMany
+            await pineconeIndex.deleteMany(vectorIds);
+            console.log('✅ Vectors deleted successfully.');
+        } catch (e) {
+            console.error('⚠️ Error deleting vectors from Pinecone (batch delete failed):', e.message);
+            // Fallback: Delete one by one if batch fails
+            try {
+                console.log('DEBUG: Attempting to delete vectors one by one...');
+                for (const id of vectorIds) {
+                    await pineconeIndex.deleteOne(id);
+                }
+                console.log('✅ Vectors deleted successfully (one by one).');
+            } catch (e2) {
+                console.error('❌ Critical Error deleting vectors:', e2.message);
+            }
+        }
     }
 };
 

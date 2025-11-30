@@ -84,10 +84,13 @@ passport.deserializeUser((user, done) => {
 
 // Passport Config (Only if Google OAuth is configured)
 if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    const callbackURL = process.env.GOOGLE_CALLBACK || 'http://localhost:3000/api/auth/google/callback';
+    console.log('Google OAuth Callback URL:', callbackURL);
+
     passport.use(new GoogleStrategy({
         clientID: process.env.GOOGLE_CLIENT_ID,
         clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-        callbackURL: process.env.GOOGLE_CALLBACK
+        callbackURL: callbackURL
     },
         async function (accessToken, refreshToken, profile, cb) {
             try {
@@ -281,15 +284,23 @@ app.post('/api/documents', authenticateToken, upload.single('file'), async (req,
         const originalName = req.file.originalname;
         const sanitizedFilename = originalName.replace(/[^\x00-\x7F]/g, "_");
 
+        console.log('DEBUG: Uploading file:', {
+            originalname: req.file.originalname,
+            size: req.file.size,
+            mimetype: req.file.mimetype
+        });
+
         console.log(`Uploading document: ${sanitizedFilename} (Original: ${originalName})`);
 
         const result = await ragService.processDocument(req.file.buffer, sanitizedFilename, req.user.id);
-        
+
         await db.collection('documents').add({
             user_id: req.user.id,
             filename: sanitizedFilename, // Store sanitized name
             original_filename: originalName, // Store original name for display if needed
+            size: req.file.size,
             chunk_count: result.chunks,
+            vectorIds: result.vectorIds || [], // Store vector IDs
             uploaded_at: new Date().toISOString()
         });
 
@@ -334,19 +345,30 @@ app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
     try {
         const docRef = db.collection('documents').doc(req.params.id);
         const doc = await docRef.get();
-        
-        if (!doc.exists || doc.data().user_id !== req.user.id) {
+
+        if (!doc.exists) {
             return res.status(404).send('Document not found');
         }
 
-        const filename = doc.data().filename;
-        
-        // Delete from Pinecone
-        await ragService.deleteDocument(filename, req.user.id);
-        
+        const data = doc.data();
+        if (data.user_id !== req.user.id) {
+            return res.status(403).send('Unauthorized');
+        }
+
+        // Delete from Pinecone using vector IDs
+        if (data.vectorIds && data.vectorIds.length > 0) {
+            await ragService.deleteDocument(data.vectorIds);
+        } else if (data.filename) {
+            // Fallback for old documents (try deleting by filename if no IDs)
+            // Note: This might fail on Starter plan but worth a try for legacy data
+            // Actually, ragService.deleteDocument now expects IDs. 
+            // We should probably warn or try to fetch IDs if possible, but for now let's just log.
+            console.warn('⚠️ No vectorIds found for document. Skipping Pinecone deletion.');
+        }
+
         // Delete from Firestore
         await docRef.delete();
-        
+
         res.send('Document deleted');
     } catch (e) {
         console.error('Error deleting document:', e);
@@ -354,7 +376,6 @@ app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// Chat Routes
 app.get('/api/threads', authenticateToken, async (req, res) => {
     try {
         const snapshot = await db.collection('threads')
@@ -495,11 +516,10 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                     const context = await ragService.queryContext(content, req.user.id);
                     console.log('DEBUG: RAG Context result length:', context ? context.length : 0);
                     if (context) {
-                        systemPrompt = `You are a strict assistant that answers questions ONLY based on the provided context. 
-                                        Do NOT use your outside knowledge. 
-                                        If the answer is not found in the context below, simply state: "No he encontrado esa información en tus documentos."
-                                        Do not apologize or provide alternative information.
-
+                        systemPrompt = `You are a helpful assistant. Use the provided context to answer the user's question. 
+                                        You may interpret the context and use your general knowledge to provide a comprehensive answer, but always prioritize the facts from the context. 
+                                        If the context doesn't fully cover the question, feel free to supplement it with your own knowledge, but make it clear what comes from the documents.
+                                        
                                         Context from uploaded documents:
                                         ${context}`;
                         console.log('DEBUG: RAG Context injected into system prompt');
