@@ -64,6 +64,7 @@ const ragService = {
             const data = await pdf(fileBuffer);
             const text = data.text;
             console.log(`DEBUG: Extracted text length: ${text.length}`);
+            console.log(`DEBUG: Text preview: ${text.substring(0, 200)}...`);
 
             if (!text || text.trim().length < 50) {
                 console.warn('⚠️ Extracted text is too short. Likely a scanned PDF or empty file.');
@@ -124,7 +125,7 @@ const ragService = {
             console.log(`DEBUG: Querying Pinecone for user: ${userId}`);
             const queryResponse = await pineconeIndex.query({
                 vector: embedding,
-                topK: 3,
+                topK: 10, // Increased from 3 to 10 to catch more context
                 filter: { userId: userId },
                 includeMetadata: true
             });
@@ -134,12 +135,12 @@ const ragService = {
                 console.log('DEBUG: Match Metadata:', queryResponse.matches.map(m => ({
                     fileName: m.metadata.fileName,
                     score: m.score,
-                    textPreview: m.metadata.text.substring(0, 50) + '...'
+                    textPreview: m.metadata.text ? m.metadata.text.substring(0, 50) + '...' : 'No text'
                 })));
             }
 
             // 3. Extract Text
-            return queryResponse.matches.map(match => match.metadata.text).join('\n\n');
+            return queryResponse.matches.map(match => `[Source Document: ${match.metadata.fileName}]\n${match.metadata.text}`).join('\n\n---\n\n');
         } catch (error) {
             console.error('❌ Error in queryContext:', error);
             return ''; // Return empty context on error to avoid breaking chat

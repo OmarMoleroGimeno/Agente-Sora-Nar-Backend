@@ -341,6 +341,53 @@ app.get('/api/documents', authenticateToken, async (req, res) => {
     }
 });
 
+// Batch Delete Documents
+app.post('/api/documents/batch-delete', authenticateToken, async (req, res) => {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).send('Invalid IDs provided');
+    }
+
+    try {
+        const batch = db.batch();
+        const vectorIdsToDelete = [];
+        const validDocIds = [];
+
+        // 1. Fetch all documents to Verify ownership and collect Vector IDs
+        const docsSnapshot = await db.collection('documents')
+            .where('user_id', '==', req.user.id)
+            .where(require('firebase-admin').firestore.FieldPath.documentId(), 'in', ids)
+            .get();
+
+        if (docsSnapshot.empty) {
+            return res.status(404).send('No documents found');
+        }
+
+        docsSnapshot.forEach(doc => {
+            const data = doc.data();
+            validDocIds.push(doc.id);
+            if (data.vectorIds && Array.isArray(data.vectorIds)) {
+                vectorIdsToDelete.push(...data.vectorIds);
+            }
+            batch.delete(doc.ref);
+        });
+
+        // 2. Delete from Pinecone (Single Batch Call)
+        if (vectorIdsToDelete.length > 0) {
+            console.log(`Deleting ${vectorIdsToDelete.length} vectors for batch document deletion...`);
+            await ragService.deleteDocument(vectorIdsToDelete);
+        }
+
+        // 3. Delete from Firestore
+        await batch.commit();
+
+        res.json({ message: 'Documents deleted', count: validDocIds.length });
+    } catch (e) {
+        console.error('Error batch deleting documents:', e);
+        res.status(500).send('Error deleting documents');
+    }
+});
+
 app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
     try {
         const docRef = db.collection('documents').doc(req.params.id);
@@ -510,15 +557,22 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                 const history = historySnapshot.docs.map(d => d.data());
 
                 // RAG: Query Context
-                let systemPrompt = 'You are a helpful assistant.';
+                let systemPrompt = `You are a helpful assistant helping a user with their uploaded documents.
+                                    IMPORTANT: If the user asks a question about specific data, reservations, files, or facts, and you do not see the answer in the context provided below, you MUST say "I cannot find that information in your uploaded documents."
+                                    Do NOT make up facts. Do NOT use general knowledge to answer questions about specific entities (like "Reservation 14") if they are not in the context.`;
+
                 try {
                     console.log(`DEBUG: Querying RAG for user ${req.user.id} with content: "${content}"`);
                     const context = await ragService.queryContext(content, req.user.id);
                     console.log('DEBUG: RAG Context result length:', context ? context.length : 0);
                     if (context) {
-                        systemPrompt = `You are a helpful assistant. Use the provided context to answer the user's question. 
-                                        You may interpret the context and use your general knowledge to provide a comprehensive answer, but always prioritize the facts from the context. 
-                                        If the context doesn't fully cover the question, feel free to supplement it with your own knowledge, but make it clear what comes from the documents.
+                        systemPrompt = `You are a precise assistant. Your goal is to answer based ONLY on the provided context.
+                                        
+                                        Strict Rules:
+                                        1. Use ONLY the information in the "Context from uploaded documents" below to answer the question.
+                                        2. If the answer is not explicitly in the context, say "I cannot find that information in your documents."
+                                        3. Do NOT use your general training data to answer questions about specific "reservations", "files", "people", or "projects".
+                                        4. Do not mention that you are an AI or that you are using a context block, just answer the question naturally but strictly based on the text.
                                         
                                         Context from uploaded documents:
                                         ${context}`;
