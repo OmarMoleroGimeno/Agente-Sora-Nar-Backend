@@ -157,10 +157,35 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
             const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
             const avatar = user.avatar_url || '';
             const role = user.role || 'user';
-            res.redirect(`${FRONTEND_URL}/login?token=${token}&username=${encodeURIComponent(user.username)}&image=${encodeURIComponent(avatar)}&role=${encodeURIComponent(role)}`);
+            const isActive = user.is_active !== false; // Default true if undefined (old users)
+            res.redirect(`${FRONTEND_URL}/login?token=${token}&username=${encodeURIComponent(user.username)}&image=${encodeURIComponent(avatar)}&role=${encodeURIComponent(role)}&setup_required=${!isActive}`);
         });
 }
 
+// Complete setup for authenticated users (e.g. from Google login)
+app.post('/api/auth/complete-setup', authenticateToken, async (req, res) => {
+    const { password } = req.body;
+    if (!password || password.length < 6) return res.status(400).send('Password must be at least 6 characters');
+
+    try {
+        const userRef = db.collection('users').doc(req.user.id);
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        await userRef.update({
+            password: hashedPassword,
+            setup_token: null,
+            is_active: true,
+            email_verified: true
+        });
+
+        res.send('Account setup completed');
+    } catch (e) {
+        console.error(e);
+        res.status(500).send('Error completing setup');
+    }
+});
+
+// Login (Only for existing users)
 // Login (Only for existing users)
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
@@ -175,6 +200,11 @@ app.post('/api/auth/login', async (req, res) => {
         const doc = snapshot.docs[0];
         const user = doc.data();
 
+        // Check if user is active (has set password)
+        if (user.is_active === false) {
+             return res.status(403).send('Account not activated. Please check your email.');
+        }
+
         if (!user.password || !(await bcrypt.compare(password, user.password))) {
             return res.status(400).send('Invalid credentials');
         }
@@ -183,6 +213,35 @@ app.post('/api/auth/login', async (req, res) => {
         res.json({ token, username: user.username, role: user.role });
     } catch (e) {
         res.status(500).send('Login error');
+    }
+});
+
+app.post('/api/auth/set-password', async (req, res) => {
+    const { token, password } = req.body;
+    if (!token || !password || password.length < 6) return res.status(400).send('Invalid request');
+
+    try {
+        const usersRef = db.collection('users');
+        const snapshot = await usersRef.where('setup_token', '==', token).get();
+
+        if (snapshot.empty) {
+            return res.status(400).send('Invalid or expired token');
+        }
+
+        const doc = snapshot.docs[0];
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        await doc.ref.update({
+            password: hashedPassword,
+            setup_token: null, // Clear token
+            is_active: true,
+            email_verified: true
+        });
+
+        res.send('Password set successfully');
+    } catch (e) {
+        console.error(e);
+        res.status(500).send('Error setting password');
     }
 });
 
@@ -199,9 +258,13 @@ app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
     }
 });
 
+const { sendWelcomeEmail } = require('./emailService');
+
+// ... (código existente hasta la ruta de crear usuario)
+
 app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
-    const { email, username, password, role } = req.body;
-    if (!email || !username || !password) return res.status(400).send('Email, username and password required');
+    const { email, username, role } = req.body;
+    if (!email || !username) return res.status(400).send('Email and username required');
 
     try {
         // Check if email already exists
@@ -211,16 +274,28 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
             return res.status(400).send('Email already exists');
         }
 
-        const hashedPassword = await bcrypt.hash(password, 10);
+        // Generate temporary setup token
+        const setupToken = require('crypto').randomBytes(32).toString('hex');
+        
         await db.collection('users').add({
             email,
             username,
-            password: hashedPassword,
             role: role || 'user',
-            created_at: new Date().toISOString()
+            created_at: new Date().toISOString(),
+            is_active: false, // User hasn't set password yet
+            setup_token: setupToken
         });
-        res.status(201).send('User created');
+
+        // Send Email
+        const setupLink = `${FRONTEND_URL}/set-password?token=${setupToken}`;
+        const emailSent = await sendWelcomeEmail(email, setupLink);
+
+        res.status(201).json({ 
+            message: 'User created and invitation sent',
+            emailSent 
+        });
     } catch (e) {
+        console.error(e);
         res.status(500).send('Error creating user');
     }
 });
