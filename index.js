@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { db } = require('./firebase');
+const { supabase } = require('./supabase');
 const OpenAI = require('openai');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
@@ -63,12 +63,18 @@ const authenticateToken = (req, res, next) => {
 // Middleware to check admin role
 const isAdmin = async (req, res, next) => {
     try {
-        const userDoc = await db.collection('users').doc(req.user.id).get();
-        if (!userDoc.exists || userDoc.data().role !== 'admin') {
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('role')
+            .eq('id', req.user.id)
+            .single();
+
+        if (error || !user || user.role !== 'admin') {
             return res.status(403).send('Admin access required');
         }
         next();
     } catch (e) {
+        console.error('Error checking permissions:', e);
         res.status(500).send('Error checking permissions');
     }
 };
@@ -103,33 +109,36 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
                     return cb(new Error('No email found in Google profile'));
                 }
 
-                const usersRef = db.collection('users');
-                // Check if user exists by email (created by admin)
-                console.log('Querying Firestore for email:', email);
-                const snapshot = await usersRef.where('email', '==', email).get();
+                // Query Supabase for email
+                console.log('Querying Supabase for email:', email);
+                const { data: user, error } = await supabase
+                    .from('users')
+                    .select('*')
+                    .eq('email', email)
+                    .single();
 
-                console.log('Firestore Query Result Empty?:', snapshot.empty);
-
-                if (snapshot.empty) {
+                if (error || !user) {
                     console.warn('User not found in DB for email:', email);
                     // User not found in DB -> Deny Access
                     return cb(null, false, { message: 'Access denied. You must be registered by an admin.' });
                 }
 
-                // User exists -> Update google_id and avatar if needed
-                const doc = snapshot.docs[0];
-                const userData = doc.data();
-                console.log('User found in DB:', userData.username);
+                console.log('User found in DB:', user.username);
 
-                if (!userData.google_id || !userData.avatar_url) {
+                // Update google_id and avatar if needed
+                if (!user.google_id || !user.avatar_url) {
                     console.log('Updating user with Google info...');
-                    await doc.ref.update({
-                        google_id: profile.id,
-                        avatar_url: profile.photos?.[0]?.value
-                    });
+                    const updates = {};
+                    if (!user.google_id) updates.google_id = profile.id;
+                    if (!user.avatar_url) updates.avatar_url = profile.photos?.[0]?.value;
+
+                    await supabase.from('users').update(updates).eq('id', user.id);
+
+                    // Update local user object
+                    if (updates.google_id) user.google_id = updates.google_id;
+                    if (updates.avatar_url) user.avatar_url = updates.avatar_url;
                 }
 
-                const user = { id: doc.id, ...userData, google_id: profile.id };
                 return cb(null, user);
             } catch (err) {
                 console.error('Google Auth Error:', err);
@@ -168,15 +177,19 @@ app.post('/api/auth/complete-setup', authenticateToken, async (req, res) => {
     if (!password || password.length < 6) return res.status(400).send('Password must be at least 6 characters');
 
     try {
-        const userRef = db.collection('users').doc(req.user.id);
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        await userRef.update({
-            password: hashedPassword,
-            setup_token: null,
-            is_active: true,
-            email_verified: true
-        });
+        const { error } = await supabase
+            .from('users')
+            .update({
+                password: hashedPassword,
+                setup_token: null,
+                is_active: true,
+                email_verified: true
+            })
+            .eq('id', req.user.id);
+
+        if (error) throw error;
 
         res.send('Account setup completed');
     } catch (e) {
@@ -186,19 +199,18 @@ app.post('/api/auth/complete-setup', authenticateToken, async (req, res) => {
 });
 
 // Login (Only for existing users)
-// Login (Only for existing users)
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     try {
-        const usersRef = db.collection('users');
-        const snapshot = await usersRef.where('email', '==', email).get();
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('email', email)
+            .single();
 
-        if (snapshot.empty) {
+        if (error || !user) {
             return res.status(400).send('Invalid credentials');
         }
-
-        const doc = snapshot.docs[0];
-        const user = doc.data();
 
         // Check if user is active (has set password)
         if (user.is_active === false) {
@@ -209,9 +221,10 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(400).send('Invalid credentials');
         }
 
-        const token = jwt.sign({ id: doc.id, username: user.username, role: user.role }, JWT_SECRET);
+        const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
         res.json({ token, username: user.username, role: user.role });
     } catch (e) {
+        console.error('Login error:', e);
         res.status(500).send('Login error');
     }
 });
@@ -221,22 +234,30 @@ app.post('/api/auth/set-password', async (req, res) => {
     if (!token || !password || password.length < 6) return res.status(400).send('Invalid request');
 
     try {
-        const usersRef = db.collection('users');
-        const snapshot = await usersRef.where('setup_token', '==', token).get();
+        // Find user by token
+        const { data: user, error: fetchError } = await supabase
+            .from('users')
+            .select('*')
+            .eq('setup_token', token)
+            .single();
 
-        if (snapshot.empty) {
+        if (fetchError || !user) {
             return res.status(400).send('Invalid or expired token');
         }
 
-        const doc = snapshot.docs[0];
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        await doc.ref.update({
-            password: hashedPassword,
-            setup_token: null, // Clear token
-            is_active: true,
-            email_verified: true
-        });
+        const { error: updateError } = await supabase
+            .from('users')
+            .update({
+                password: hashedPassword,
+                setup_token: null, // Clear token
+                is_active: true,
+                email_verified: true
+            })
+            .eq('id', user.id);
+
+        if (updateError) throw updateError;
 
         res.send('Password set successfully');
     } catch (e) {
@@ -250,26 +271,25 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     if (!email) return res.status(400).send('Email required');
 
     try {
-        const usersRef = db.collection('users');
-        const snapshot = await usersRef.where('email', '==', email).get();
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('email', email)
+            .single();
 
-        if (snapshot.empty) {
-            // Security: Don't reveal if user exists. Just return success or simulate delay.
-            // But for detailed feedback let's just say "If email exists..."
-            // Or return 200 anyway.
+        if (error || !user) {
+            // Security: Don't reveal if user exists
             return res.status(200).send('If the email exists, a reset link has been sent.');
         }
-
-        const doc = snapshot.docs[0];
-        const user = doc.data();
 
         // Generate reset token
         const resetToken = require('crypto').randomBytes(32).toString('hex');
         
-        // Update user with reset token (valid for e.g. 1 hour - simplified here)
-        await doc.ref.update({
-             setup_token: resetToken // Reusing setup_token field for simplicity as it behaves same way (one-time use)
-        });
+        // Update user with reset token
+        await supabase
+            .from('users')
+            .update({ setup_token: resetToken })
+            .eq('id', user.id);
 
         // Send Email
         const resetLink = `${FRONTEND_URL}/set-password?token=${resetToken}`;
@@ -285,19 +305,23 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 // Admin Routes: User Management
 app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
     try {
-        const snapshot = await db.collection('users').get();
-        const users = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        const { data: users, error } = await supabase.from('users').select('*');
+
+        if (error) throw error;
+        
         // Don't send passwords
-        users.forEach(u => delete u.password);
-        res.json(users);
+        const sanitizedUsers = users.map(user => {
+            const { password, ...rest } = user;
+            return rest;
+        });
+        res.json(sanitizedUsers);
     } catch (e) {
+        console.error('Error fetching users:', e);
         res.status(500).send('Error fetching users');
     }
 });
 
 const { sendWelcomeEmail, sendResetPasswordEmail } = require('./emailService');
-
-// ... (código existente hasta la ruta de crear usuario)
 
 app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
     const { email, username, role } = req.body;
@@ -305,23 +329,32 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
 
     try {
         // Check if email already exists
-        const usersRef = db.collection('users');
-        const snapshot = await usersRef.where('email', '==', email).get();
-        if (!snapshot.empty) {
+        const { data: existingUser, error: checkError } = await supabase
+            .from('users')
+            .select('id')
+            .eq('email', email)
+            .single();
+
+        if (existingUser) {
             return res.status(400).send('Email already exists');
         }
 
         // Generate temporary setup token
         const setupToken = require('crypto').randomBytes(32).toString('hex');
         
-        await db.collection('users').add({
-            email,
-            username,
-            role: role || 'user',
-            created_at: new Date().toISOString(),
-            is_active: false, // User hasn't set password yet
-            setup_token: setupToken
-        });
+        const { data: newUser, error: insertError } = await supabase
+            .from('users')
+            .insert({
+                email,
+                username,
+                role: role || 'user',
+                created_at: new Date().toISOString(),
+                is_active: false, // User hasn't set password yet
+                setup_token: setupToken
+            })
+            .select();
+
+        if (insertError) throw insertError;
 
         // Send Email
         const setupLink = `${FRONTEND_URL}/set-password?token=${setupToken}`;
@@ -339,16 +372,19 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
 
 app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
     try {
-        await db.collection('users').doc(req.params.id).delete();
+        const { error } = await supabase
+            .from('users')
+            .delete()
+            .eq('id', req.params.id);
+
+        if (error) throw error;
+
         res.send('User deleted');
     } catch (e) {
+        console.error('Error deleting user:', e);
         res.status(500).send('Error deleting user');
     }
 });
-
-// Change user password (Admin only, cannot change other admin passwords)
-// Change password route removed entirely to enforce "Forgot Password" flow only.
-// app.put('/api/users/:id/password', ... ) - DISABLED
 
 // Document Routes (RAG)
 app.post('/api/documents', authenticateToken, upload.single('file'), async (req, res) => {
@@ -361,25 +397,21 @@ app.post('/api/documents', authenticateToken, upload.single('file'), async (req,
         const originalName = req.file.originalname;
         const sanitizedFilename = originalName.replace(/[^\x00-\x7F]/g, "_");
 
-        console.log('DEBUG: Uploading file:', {
-            originalname: req.file.originalname,
-            size: req.file.size,
-            mimetype: req.file.mimetype
-        });
-
         console.log(`Uploading document: ${sanitizedFilename} (Original: ${originalName})`);
 
         const result = await ragService.processDocument(req.file.buffer, sanitizedFilename, req.user.id);
 
-        await db.collection('documents').add({
+        const { error } = await supabase.from('documents').insert({
             user_id: req.user.id,
-            filename: sanitizedFilename, // Store sanitized name
-            original_filename: originalName, // Store original name for display if needed
+            filename: sanitizedFilename,
+            original_filename: originalName,
             size: req.file.size,
             chunk_count: result.chunks,
-            vectorIds: result.vectorIds || [], // Store vector IDs
+            vector_ids: result.vectorIds || [], // Store vector IDs as JSONB
             uploaded_at: new Date().toISOString()
         });
+
+        if (error) throw error;
 
         res.json({ message: 'Document processed', chunks: result.chunks });
     } catch (e) {
@@ -390,29 +422,16 @@ app.post('/api/documents', authenticateToken, upload.single('file'), async (req,
 
 app.get('/api/documents', authenticateToken, async (req, res) => {
     try {
-        const snapshot = await db.collection('documents')
-            .where('user_id', '==', req.user.id)
-            .orderBy('uploaded_at', 'desc')
-            .get();
-        const documents = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        const { data: documents, error } = await supabase
+            .from('documents')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .order('uploaded_at', { ascending: false });
+
+        if (error) throw error;
+
         res.json(documents);
     } catch (e) {
-        // Handle missing index error
-        if (e.code === 9 || e.message.includes('requires an index')) {
-            console.warn('⚠️ Firestore index missing for documents. Falling back to client-side sorting.');
-            try {
-                const snapshot = await db.collection('documents')
-                    .where('user_id', '==', req.user.id)
-                    .get();
-                const documents = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                // Sort in memory
-                documents.sort((a, b) => new Date(b.uploaded_at) - new Date(a.uploaded_at));
-                return res.json(documents);
-            } catch (retryErr) {
-                console.error('Retry failed:', retryErr);
-            }
-        }
-
         console.error('Error fetching documents:', e);
         res.status(500).send('Error fetching documents');
     }
@@ -426,37 +445,38 @@ app.post('/api/documents/batch-delete', authenticateToken, async (req, res) => {
     }
 
     try {
-        const batch = db.batch();
-        const vectorIdsToDelete = [];
-        const validDocIds = [];
+        // 1. Fetch documents to get Vector IDs
+        const { data: docs, error: fetchError } = await supabase
+            .from('documents')
+            .select('id, vector_ids')
+            .eq('user_id', req.user.id)
+            .in('id', ids);
 
-        // 1. Fetch all documents to Verify ownership and collect Vector IDs
-        const docsSnapshot = await db.collection('documents')
-            .where('user_id', '==', req.user.id)
-            .where(require('firebase-admin').firestore.FieldPath.documentId(), 'in', ids)
-            .get();
-
-        if (docsSnapshot.empty) {
+        if (fetchError || !docs || docs.length === 0) {
             return res.status(404).send('No documents found');
         }
 
-        docsSnapshot.forEach(doc => {
-            const data = doc.data();
-            validDocIds.push(doc.id);
-            if (data.vectorIds && Array.isArray(data.vectorIds)) {
-                vectorIdsToDelete.push(...data.vectorIds);
+        const vectorIdsToDelete = [];
+        const validDocIds = docs.map(d => d.id);
+
+        docs.forEach(doc => {
+            if (doc.vector_ids && Array.isArray(doc.vector_ids)) {
+                vectorIdsToDelete.push(...doc.vector_ids);
             }
-            batch.delete(doc.ref);
         });
 
-        // 2. Delete from Pinecone (Single Batch Call)
+        // 2. Delete from Pinecone
         if (vectorIdsToDelete.length > 0) {
-            console.log(`Deleting ${vectorIdsToDelete.length} vectors for batch document deletion...`);
             await ragService.deleteDocument(vectorIdsToDelete);
         }
 
-        // 3. Delete from Firestore
-        await batch.commit();
+        // 3. Delete from Supabase
+        const { error: deleteError } = await supabase
+            .from('documents')
+            .delete()
+            .in('id', validDocIds);
+
+        if (deleteError) throw deleteError;
 
         res.json({ message: 'Documents deleted', count: validDocIds.length });
     } catch (e) {
@@ -467,31 +487,32 @@ app.post('/api/documents/batch-delete', authenticateToken, async (req, res) => {
 
 app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
     try {
-        const docRef = db.collection('documents').doc(req.params.id);
-        const doc = await docRef.get();
+        const { data: doc, error: fetchError } = await supabase
+            .from('documents')
+            .select('*')
+            .eq('id', req.params.id)
+            .single();
 
-        if (!doc.exists) {
+        if (fetchError || !doc) {
             return res.status(404).send('Document not found');
         }
 
-        const data = doc.data();
-        if (data.user_id !== req.user.id) {
+        if (doc.user_id !== req.user.id) {
             return res.status(403).send('Unauthorized');
         }
 
-        // Delete from Pinecone using vector IDs
-        if (data.vectorIds && data.vectorIds.length > 0) {
-            await ragService.deleteDocument(data.vectorIds);
-        } else if (data.filename) {
-            // Fallback for old documents (try deleting by filename if no IDs)
-            // Note: This might fail on Starter plan but worth a try for legacy data
-            // Actually, ragService.deleteDocument now expects IDs. 
-            // We should probably warn or try to fetch IDs if possible, but for now let's just log.
-            console.warn('⚠️ No vectorIds found for document. Skipping Pinecone deletion.');
+        // Delete from Pinecone
+        if (doc.vector_ids && doc.vector_ids.length > 0) {
+            await ragService.deleteDocument(doc.vector_ids);
         }
 
-        // Delete from Firestore
-        await docRef.delete();
+        // Delete from Supabase
+        const { error: deleteError } = await supabase
+            .from('documents')
+            .delete()
+            .eq('id', req.params.id);
+
+        if (deleteError) throw deleteError;
 
         res.send('Document deleted');
     } catch (e) {
@@ -502,30 +523,16 @@ app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
 
 app.get('/api/threads', authenticateToken, async (req, res) => {
     try {
-        const snapshot = await db.collection('threads')
-            .where('user_id', '==', req.user.id)
-            .orderBy('created_at', 'desc')
-            .get();
-        const threads = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        const { data: threads, error } = await supabase
+            .from('threads')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
         res.json(threads);
     } catch (e) {
         console.error('Error fetching threads:', e);
-        // If index is missing, it returns a specific error code (9). 
-        // We can temporarily return empty array or unsorted results to avoid 500
-        if (e.code === 9 || e.message.includes('requires an index')) {
-            console.log('Index missing. Returning unsorted threads temporarily.');
-            try {
-                const snapshot = await db.collection('threads')
-                    .where('user_id', '==', req.user.id)
-                    .get();
-                const threads = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                // Sort manually in memory
-                threads.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-                return res.json(threads);
-            } catch (retryErr) {
-                console.error('Retry failed:', retryErr);
-            }
-        }
         res.status(500).send('Error fetching threads');
     }
 });
@@ -536,14 +543,18 @@ app.post('/api/threads', authenticateToken, async (req, res) => {
     const timestamp = new Date().toISOString();
 
     try {
-        await db.collection('threads').doc(id).set({
+        const { error } = await supabase.from('threads').insert({
             id,
             user_id: req.user.id,
             title,
             created_at: timestamp
         });
+
+        if (error) throw error;
+
         res.json({ id, title, created_at: timestamp });
     } catch (e) {
+        console.error('Error creating thread:', e);
         res.status(500).send('Error creating thread');
     }
 });
@@ -551,33 +562,47 @@ app.post('/api/threads', authenticateToken, async (req, res) => {
 app.put('/api/threads/:id', authenticateToken, async (req, res) => {
     const { title } = req.body;
     try {
-        const threadRef = db.collection('threads').doc(req.params.id);
-        const doc = await threadRef.get();
-        if (!doc.exists || doc.data().user_id !== req.user.id) {
-            return res.status(404).send('Thread not found');
-        }
-        await threadRef.update({ title });
+        const { data: thread, error: fetchError } = await supabase
+            .from('threads')
+            .select('user_id')
+            .eq('id', req.params.id)
+            .single();
+
+        if (fetchError || !thread) return res.status(404).send('Thread not found');
+        if (thread.user_id !== req.user.id) return res.status(403).send('Unauthorized');
+
+        const { error: updateError } = await supabase
+            .from('threads')
+            .update({ title })
+            .eq('id', req.params.id);
+
+        if (updateError) throw updateError;
+
         res.json({ id: req.params.id, title });
     } catch (e) {
+        console.error('Error updating thread:', e);
         res.status(500).send('Error updating thread');
     }
 });
 
 app.delete('/api/threads/:id', authenticateToken, async (req, res) => {
     try {
-        const threadRef = db.collection('threads').doc(req.params.id);
-        const doc = await threadRef.get();
-        if (!doc.exists || doc.data().user_id !== req.user.id) {
-            return res.status(404).send('Thread not found');
-        }
-        // Delete thread and its messages
-        const batch = db.batch();
-        batch.delete(threadRef);
-        const messagesSnapshot = await threadRef.collection('messages').get();
-        messagesSnapshot.docs.forEach(doc => {
-            batch.delete(doc.ref);
-        });
-        await batch.commit();
+        const { data: thread, error: fetchError } = await supabase
+            .from('threads')
+            .select('user_id')
+            .eq('id', req.params.id)
+            .single();
+
+        if (fetchError || !thread) return res.status(404).send('Thread not found');
+        if (thread.user_id !== req.user.id) return res.status(403).send('Unauthorized');
+
+        const { error: deleteError } = await supabase
+            .from('threads')
+            .delete()
+            .eq('id', req.params.id);
+
+        if (deleteError) throw deleteError;
+
         res.send('Thread deleted');
     } catch (e) {
         console.error('Error deleting thread:', e);
@@ -587,61 +612,87 @@ app.delete('/api/threads/:id', authenticateToken, async (req, res) => {
 
 app.get('/api/threads/:id/messages', authenticateToken, async (req, res) => {
     try {
-        const threadDoc = await db.collection('threads').doc(req.params.id).get();
-        if (!threadDoc.exists || threadDoc.data().user_id !== req.user.id) {
-            return res.status(404).send('Thread not found');
-        }
+        const { data: thread, error: fetchError } = await supabase
+            .from('threads')
+            .select('user_id')
+            .eq('id', req.params.id)
+            .single();
 
-        const snapshot = await db.collection('threads').doc(req.params.id)
-            .collection('messages')
-            .orderBy('timestamp', 'asc')
-            .get();
+        if (fetchError || !thread) return res.status(404).send('Thread not found');
+        if (thread.user_id !== req.user.id) return res.status(403).send('Unauthorized');
 
-        const messages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        const { data: messages, error: msgError } = await supabase
+            .from('messages')
+            .select('*')
+            .eq('thread_id', req.params.id)
+            .order('timestamp', { ascending: true });
+
+        if (msgError) throw msgError;
+
         res.json(messages);
     } catch (e) {
+        console.error('Error fetching messages:', e);
         res.status(500).send('Error fetching messages');
     }
 });
 
+// NON-STREAMING ROUTE IMPLEMENTATION WITH SUPABASE
 app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
     const { content } = req.body;
     const threadId = req.params.id;
 
     try {
-        const threadRef = db.collection('threads').doc(threadId);
-        const threadDoc = await threadRef.get();
+        // Check thread ownership
+        const { data: thread, error: fetchError } = await supabase
+            .from('threads')
+            .select('user_id, title')
+            .eq('id', threadId)
+            .single();
 
-        if (!threadDoc.exists || threadDoc.data().user_id !== req.user.id) {
+        if (fetchError || !thread) {
             return res.status(404).send('Thread not found');
+        }
+        if (thread.user_id !== req.user.id) {
+            return res.status(403).send('Unauthorized');
         }
 
         // Save user message
         const userMsgTimestamp = new Date().toISOString();
-        const userMsg = {
-            role: 'user',
-            content,
-            timestamp: userMsgTimestamp
-        };
-        await threadRef.collection('messages').add(userMsg);
+        const { data: savedUserMsg, error: userMsgError } = await supabase
+            .from('messages')
+            .insert({
+                thread_id: threadId,
+                role: 'user',
+                content,
+                timestamp: userMsgTimestamp
+            })
+            .select()
+            .single();
 
-        // AI Response
+        if (userMsgError) throw userMsgError;
+
+        // AI Response Logic
         let aiContent = '';
-        if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.startsWith('sk-')) {
+
+        if (process.env.OPENAI_API_KEY) {
             try {
-                const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-                const historySnapshot = await threadRef.collection('messages').orderBy('timestamp', 'asc').get();
-                const history = historySnapshot.docs.map(d => d.data());
+                // Initialize OpenAI
+                const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+                // Fetch History
+                const { data: history, error: historyError } = await supabase
+                    .from('messages')
+                    .select('role, content')
+                    .eq('thread_id', threadId)
+                    .order('timestamp', { ascending: true });
 
                 // RAG: Query Context
-                let systemPrompt = `You are a helpful assistant helping a user with their uploaded documents.
-                                    IMPORTANT: If the user asks a question about specific data, reservations, files, or facts, and you do not see the answer in the context provided below, you MUST say "I cannot find that information in your uploaded documents."
-                                    Do NOT make up facts. Do NOT use general knowledge to answer questions about specific entities (like "Reservation 14") if they are not in the context.`;
-
+                let systemPrompt = `You are a helpful assistant helping a user with their uploaded documents.`;
+                
                 try {
-                    console.log(`DEBUG: Querying RAG for user ${req.user.id} with content: "${content}"`);
+                    console.log(`DEBUG: Querying RAG for user ${req.user.id}`);
                     const context = await ragService.queryContext(content, req.user.id);
-                    console.log('DEBUG: RAG Context result length:', context ? context.length : 0);
+                    
                     if (context) {
                         systemPrompt = `Eres un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. Tu objetivo es recomendar la mejor herramienta basándote ÚNICAMENTE en el contexto proporcionado.
                                         
@@ -683,9 +734,6 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
 
                                         Contexto de documentos subidos:
                                         ${context}`;
-                        console.log('DEBUG: RAG Context injected into system prompt');
-                    } else {
-                        console.log('DEBUG: No relevant context found');
                     }
                 } catch (ragError) {
                     console.error('DEBUG: RAG Error:', ragError);
@@ -693,55 +741,66 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
 
                 const messages = [
                     { role: 'system', content: systemPrompt },
-                    ...history.map(m => ({ role: m.role, content: m.content }))
+                    ...(history || []).map(m => ({ role: m.role, content: m.content }))
                 ];
 
-                const completion = await openai.chat.completions.create({
+                const completion = await openaiClient.chat.completions.create({
                     messages: messages,
-                    model: process.env.OPENAI_MODEL,
+                    model: process.env.OPENAI_MODEL || 'gpt-4o',
+                    // stream: false (default)
                 });
                 aiContent = completion.choices[0].message.content;
+
             } catch (error) {
                 console.error('OpenAI Error:', error);
                 aiContent = 'Error connecting to AI service.';
             }
         } else {
+             // Mock AI
             aiContent = `(Mock AI) I received: "${content}".`;
         }
 
-        // Save AI message
+        // Save AI message to Supabase
         const aiMsgTimestamp = new Date().toISOString();
-        const aiMsg = {
-            role: 'assistant',
-            content: aiContent,
-            timestamp: aiMsgTimestamp
-        };
-        await threadRef.collection('messages').add(aiMsg);
+        const { data: savedAiMsg, error: aiMsgError } = await supabase
+            .from('messages')
+            .insert({
+                thread_id: threadId,
+                role: 'assistant',
+                content: aiContent,
+                timestamp: aiMsgTimestamp
+            })
+            .select()
+            .single();
 
-        // Generate Title if it's a new chat
+        if (aiMsgError) throw aiMsgError;
+
+        // Generate/Update Title if needed
         let newTitle = null;
-        if (threadDoc.data().title === 'New Chat' && process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.startsWith('sk-')) {
+        if (thread.title === 'New Chat' && process.env.OPENAI_API_KEY) {
             try {
-                const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-                const titleCompletion = await openai.chat.completions.create({
-                    messages: [
+                const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+                const titleCompletion = await openaiClient.chat.completions.create({
+                     messages: [
                         { role: 'system', content: 'Generate a very short, concise title (max 5 words) for this chat based on the user message. Do not use quotes.' },
                         { role: 'user', content }
                     ],
-                    model: process.env.OPENAI_MODEL,
+                    model: process.env.OPENAI_MODEL || 'gpt-4o',
                 });
                 newTitle = titleCompletion.choices[0].message.content.trim();
-                await threadRef.update({ title: newTitle });
-            } catch (error) {
-                console.error('Error generating title:', error);
-            }
+                await supabase
+                    .from('threads')
+                    .update({ title: newTitle })
+                    .eq('id', threadId);
+            } catch (ignore) {}
         }
 
         res.json({
-            userMessage: { role: 'user', content, timestamp: userMsgTimestamp },
-            aiMessage: { role: 'assistant', content: aiContent, timestamp: aiMsgTimestamp },
-            newTitle // Return the new title if generated
+            userMessage: savedUserMsg,
+            aiMessage: savedAiMsg,
+            newTitle
         });
+
     } catch (e) {
         console.error(e);
         res.status(500).send('Error sending message');
