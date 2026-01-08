@@ -245,6 +245,43 @@ app.post('/api/auth/set-password', async (req, res) => {
     }
 });
 
+app.post('/api/auth/forgot-password', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).send('Email required');
+
+    try {
+        const usersRef = db.collection('users');
+        const snapshot = await usersRef.where('email', '==', email).get();
+
+        if (snapshot.empty) {
+            // Security: Don't reveal if user exists. Just return success or simulate delay.
+            // But for detailed feedback let's just say "If email exists..."
+            // Or return 200 anyway.
+            return res.status(200).send('If the email exists, a reset link has been sent.');
+        }
+
+        const doc = snapshot.docs[0];
+        const user = doc.data();
+
+        // Generate reset token
+        const resetToken = require('crypto').randomBytes(32).toString('hex');
+        
+        // Update user with reset token (valid for e.g. 1 hour - simplified here)
+        await doc.ref.update({
+             setup_token: resetToken // Reusing setup_token field for simplicity as it behaves same way (one-time use)
+        });
+
+        // Send Email
+        const resetLink = `${FRONTEND_URL}/set-password?token=${resetToken}`;
+        await sendResetPasswordEmail(email, resetLink);
+
+        res.send('Reset link sent');
+    } catch (e) {
+        console.error(e);
+        res.status(500).send('Error requesting password reset');
+    }
+});
+
 // Admin Routes: User Management
 app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
     try {
@@ -258,7 +295,7 @@ app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
     }
 });
 
-const { sendWelcomeEmail } = require('./emailService');
+const { sendWelcomeEmail, sendResetPasswordEmail } = require('./emailService');
 
 // ... (código existente hasta la ruta de crear usuario)
 
@@ -310,43 +347,8 @@ app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
 });
 
 // Change user password (Admin only, cannot change other admin passwords)
-app.put('/api/users/:id/password', authenticateToken, isAdmin, async (req, res) => {
-    const { newPassword } = req.body;
-
-    if (!newPassword || newPassword.length < 6) {
-        return res.status(400).send('Password must be at least 6 characters');
-    }
-
-    try {
-        const userRef = db.collection('users').doc(req.params.id);
-        const userDoc = await userRef.get();
-
-        if (!userDoc.exists) {
-            return res.status(404).send('User not found');
-        }
-
-        const userData = userDoc.data();
-
-        // Prevent changing passwords of other admins
-        if (userData.role === 'admin') {
-            return res.status(403).send('Cannot change password of admin users');
-        }
-
-        // Hash the new password
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-        // Update the password
-        await userRef.update({
-            password: hashedPassword,
-            password_updated_at: new Date().toISOString()
-        });
-
-        res.send('Password updated successfully');
-    } catch (e) {
-        console.error('Error updating password:', e);
-        res.status(500).send('Error updating password');
-    }
-});
+// Change password route removed entirely to enforce "Forgot Password" flow only.
+// app.put('/api/users/:id/password', ... ) - DISABLED
 
 // Document Routes (RAG)
 app.post('/api/documents', authenticateToken, upload.single('file'), async (req, res) => {

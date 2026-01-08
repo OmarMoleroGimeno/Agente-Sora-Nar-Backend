@@ -37,6 +37,7 @@ const createTransporter = () => {
 };
 
 const { WelcomeTemplate } = require('./templates/welcome');
+const { ResetPasswordTemplate } = require('./templates/reset_password');
 
 const sendWelcomeEmail = async (email, resetLink) => {
     const transporter = createTransporter();
@@ -59,4 +60,24 @@ const sendWelcomeEmail = async (email, resetLink) => {
 };
 
 
-module.exports = { sendWelcomeEmail };
+const sendResetPasswordEmail = async (email, resetLink) => {
+    const transporter = createTransporter();
+    
+    try {
+        const htmlContent = ResetPasswordTemplate(resetLink);
+
+        await transporter.sendMail({
+            from: process.env.SMTP_FROM || '"Aphelion Security" <noreply@aphelion.com>',
+            to: email,
+            subject: 'Restablecer Contraseña - NAR Valencia',
+            html: htmlContent,
+        });
+        console.log(`📨 Reset password email sent to ${email}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Error sending reset email:', error);
+        return false;
+    }
+};
+
+module.exports = { sendWelcomeEmail, sendResetPasswordEmail };
