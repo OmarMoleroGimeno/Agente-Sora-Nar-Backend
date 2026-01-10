@@ -368,13 +368,33 @@ app.post('/api/documents', authenticateToken, upload.single('file'), async (req,
 
 app.get('/api/documents', authenticateToken, async (req, res) => {
     try {
-        const { data: documents, error } = await supabase
+        let query = supabaseAdmin
             .from('documents')
             .select('*')
-            .eq('user_id', req.user.id)
             .order('uploaded_at', { ascending: false });
 
+        const { data: documents, error } = await query;
         if (error) throw error;
+
+        // If not admin, sanitize filenames or hide details
+        if (req.user.role !== 'admin') {
+            // Return a simplified list so the frontend knows "there is knowledge"
+            // but doesn't see actual filenames/links if that's what "verlo" means.
+            // Actually, simply returning the list allows the frontend to say "Configuration Ready".
+            // If the user means "Don't show the PDF list in a UI", the ToolAdvisor doesn't show the list anyway (only KnowledgeBase view does).
+            // But main layout might allow navigation to KnowledgeBase?
+            // User said: "que no puedan verlo" (that they cannot see it).
+            // ToolAdvisor uses it to enable chat.
+            // KnowledgeView uses it to list/manage.
+            // I should probably BLOCK specific details for non-admins if they call the API.
+            const sanitized = documents.map(d => ({
+                id: d.id,
+                filename: 'Conocimiento del Sistema', // Hide real name
+                size: d.size,
+                uploaded_at: d.uploaded_at
+            }));
+            return res.json(sanitized);
+        }
 
         res.json(documents);
     } catch (e) {
@@ -632,7 +652,7 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                 
                 try {
                     console.log(`DEBUG: Querying RAG for user ${req.user.id}`);
-                    const context = await ragService.queryContext(content, req.user.id);
+                    const context = await ragService.queryContext(content, req.user.id, req.user.role);
                     
                     if (context) {
                         systemPrompt = `Eres Sonar, un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. Tu objetivo es recomendar la mejor herramienta basándote ÚNICAMENTE en el contexto proporcionado.

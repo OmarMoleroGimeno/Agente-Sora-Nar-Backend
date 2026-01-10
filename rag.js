@@ -114,7 +114,7 @@ const ragService = {
         }
     },
 
-    async queryContext(query, userId) {
+    async queryContext(query, userId, userRole = 'user') {
         if (!pineconeIndex) return [];
 
         try {
@@ -125,25 +125,19 @@ const ragService = {
             console.log(`DEBUG: Querying Pinecone for user: ${userId}`);
             const queryResponse = await pineconeIndex.query({
                 vector: embedding,
-                topK: 10, // Increased from 3 to 10 to catch more context
-                filter: { userId: userId },
+                topK: 10,
                 includeMetadata: true
             });
             console.log('DEBUG: Pinecone matches:', queryResponse.matches.length);
 
-            if (queryResponse.matches.length > 0) {
-                console.log('DEBUG: Match Metadata:', queryResponse.matches.map(m => ({
-                    fileName: m.metadata.fileName,
-                    score: m.score,
-                    textPreview: m.metadata.text ? m.metadata.text.substring(0, 50) + '...' : 'No text'
-                })));
-            }
-
             // 3. Extract Text
-            return queryResponse.matches.map(match => `[Source Document: ${match.metadata.fileName}]\n${match.metadata.text}`).join('\n\n---\n\n');
+            return queryResponse.matches.map(match => {
+                const sourceName = userRole === 'admin' ? match.metadata.fileName : 'Manual de Referencia';
+                return `[Source Document: ${sourceName}]\n${match.metadata.text}`;
+            }).join('\n\n---\n\n');
         } catch (error) {
             console.error('❌ Error in queryContext:', error);
-            return ''; // Return empty context on error to avoid breaking chat
+            return '';
         }
     },
 
