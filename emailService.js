@@ -46,9 +46,9 @@ const sendWelcomeEmail = async (email, resetLink) => {
         const htmlContent = WelcomeTemplate(resetLink);
 
         await transporter.sendMail({
-            from: process.env.SMTP_FROM || '"Aphelion Security" <noreply@aphelion.com>',
+            from: process.env.SMTP_FROM || '"Sonar Security" <noreply@sonar.com>',
             to: email,
-            subject: 'Invitación a Aphelion - Configura tu Acceso',
+            subject: 'Invitación a Sonar - Configura tu Acceso',
             html: htmlContent,
         });
         console.log(`📨 Invitation email sent to ${email}`);
@@ -67,7 +67,7 @@ const sendResetPasswordEmail = async (email, resetLink) => {
         const htmlContent = ResetPasswordTemplate(resetLink);
 
         await transporter.sendMail({
-            from: process.env.SMTP_FROM || '"Aphelion Security" <noreply@aphelion.com>',
+            from: process.env.SMTP_FROM || '"Sonar Security" <noreply@sonar.com>',
             to: email,
             subject: 'Restablecer Contraseña - NAR Valencia',
             html: htmlContent,

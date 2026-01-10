@@ -27,7 +27,7 @@
             </EText>
             
             <EText style="margin: 0 0 24px; font-size: 16px; line-height: 1.6; color: #374151; text-align: left;">
-                Su perfil ha sido pre-aprobado por nuestro equipo de administración. Le invitamos a activar su cuenta para acceder al sistema de gestión centralizado <strong>Aphelion</strong>.
+                Su perfil ha sido pre-aprobado por nuestro equipo de administración. Le invitamos a activar su cuenta para acceder al sistema de gestión centralizado <strong>Sonar</strong>.
             </EText>
 
             <EText style="margin: 0 0 32px; font-size: 16px; line-height: 1.6; color: #374151; text-align: left;">
@@ -61,7 +61,7 @@
             </EText>
             
             <EText style="margin: 0; font-size: 11px; color: #d1d5db; text-transform: uppercase; letter-spacing: 1px;">
-                Powered by Aphelion Core
+                Powered by Sonar Core
             </EText>
         </ESection>
 

@@ -635,7 +635,7 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                     const context = await ragService.queryContext(content, req.user.id);
                     
                     if (context) {
-                        systemPrompt = `Eres un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. Tu objetivo es recomendar la mejor herramienta basándote ÚNICAMENTE en el contexto proporcionado.
+                        systemPrompt = `Eres Sonar, un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. Tu objetivo es recomendar la mejor herramienta basándote ÚNICAMENTE en el contexto proporcionado.
                                         
                                         Contexto de documentos subidos:
                                         ${context}`;
