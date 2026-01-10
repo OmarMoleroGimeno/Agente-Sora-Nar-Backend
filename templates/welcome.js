@@ -6,7 +6,7 @@ const WelcomeTemplate = (link) => `
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bienvenido a NAR</title>
 </head>
-<body style="background-color: #f3f4f6; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 0; padding: 0;">
+<body style="background-color: #f3f4f6; padding-top: 40px; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 0; padding: 0;">
     
     <div style="display: none; max-height: 0; overflow: hidden;">
         Bienvenido a la plataforma digital de NAR. Active su acceso seguro aquí.

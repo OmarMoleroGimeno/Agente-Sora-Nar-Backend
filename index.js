@@ -1,12 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { supabase } = require('./supabase');
+const { supabase, supabaseAdmin } = require('./supabase');
 const OpenAI = require('openai');
-const passport = require('passport');
-const GoogleStrategy = require('passport-google-oauth20').Strategy;
-const session = require('express-session');
 const multer = require('multer');
 const ragService = require('./rag');
 require('dotenv').config();
@@ -35,273 +31,222 @@ app.use((req, res, next) => {
 
 app.get('/ping', (req, res) => res.send('pong'));
 
-// Session config for Passport
-app.use(session({
-    secret: 'keyboard cat',
-    resave: false,
-    saveUninitialized: false
-}));
-app.use(passport.initialize());
-app.use(passport.session());
-
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'secret';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
-// Middleware to authenticate token
-const authenticateToken = (req, res, next) => {
+// Middleware to authenticate token using Supabase Auth
+const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.sendStatus(401);
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
-        req.user = user;
-        next();
-    });
-};
-
-// Middleware to check admin role
-const isAdmin = async (req, res, next) => {
     try {
-        const { data: user, error } = await supabase
+        // 1. Verify token with Supabase
+        const { data: { user }, error } = await supabase.auth.getUser(token);
+        
+        if (error || !user) {
+            console.error('Supabase Auth verification failed:', error?.message);
+            return res.sendStatus(403);
+        }
+
+        // 2. Fetch user from our public.users table to get Role
+        const { data: dbUser, error: dbError } = await supabase
             .from('users')
-            .select('role')
-            .eq('id', req.user.id)
+            .select('*')
+            .eq('email', user.email)
             .single();
-
-        if (error || !user || user.role !== 'admin') {
-            return res.status(403).send('Admin access required');
+        
+        if (dbError || !dbUser) {
+             console.warn(`User ${user.email} authenticated via Google but not found in public.users.`);
+             return res.status(403).send('User not registered in system.');
         }
+
+        req.user = dbUser; // Attach our DB user (with role)
         next();
-    } catch (e) {
-        console.error('Error checking permissions:', e);
-        res.status(500).send('Error checking permissions');
+    } catch (err) {
+        console.error('Auth Error:', err.message);
+        return res.sendStatus(403);
     }
 };
 
-// Passport Config
-passport.serializeUser((user, done) => {
-    done(null, user);
-});
-
-passport.deserializeUser((user, done) => {
-    done(null, user);
-});
-
-// Passport Config (Only if Google OAuth is configured)
-if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
-    const callbackURL = process.env.GOOGLE_CALLBACK || 'http://localhost:3000/api/auth/google/callback';
-    console.log('Google OAuth Callback URL:', callbackURL);
-
-    passport.use(new GoogleStrategy({
-        clientID: process.env.GOOGLE_CLIENT_ID,
-        clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-        callbackURL: callbackURL
-    },
-        async function (accessToken, refreshToken, profile, cb) {
-            try {
-                console.log('Google Auth Callback Started');
-                const email = profile.emails?.[0]?.value;
-                console.log('Google Profile Email:', email);
-
-                if (!email) {
-                    console.error('No email found in Google profile');
-                    return cb(new Error('No email found in Google profile'));
-                }
-
-                // Query Supabase for email
-                console.log('Querying Supabase for email:', email);
-                const { data: user, error } = await supabase
-                    .from('users')
-                    .select('*')
-                    .eq('email', email)
-                    .single();
-
-                if (error || !user) {
-                    console.warn('User not found in DB for email:', email);
-                    // User not found in DB -> Deny Access
-                    return cb(null, false, { message: 'Access denied. You must be registered by an admin.' });
-                }
-
-                console.log('User found in DB:', user.username);
-
-                // Update google_id and avatar if needed
-                if (!user.google_id || !user.avatar_url) {
-                    console.log('Updating user with Google info...');
-                    const updates = {};
-                    if (!user.google_id) updates.google_id = profile.id;
-                    if (!user.avatar_url) updates.avatar_url = profile.photos?.[0]?.value;
-
-                    await supabase.from('users').update(updates).eq('id', user.id);
-
-                    // Update local user object
-                    if (updates.google_id) user.google_id = updates.google_id;
-                    if (updates.avatar_url) user.avatar_url = updates.avatar_url;
-                }
-
-                return cb(null, user);
-            } catch (err) {
-                console.error('Google Auth Error:', err);
-                return cb(err);
-            }
-        }
-    ));
-    console.log('✅ Google OAuth configured');
-} else {
-    console.log('⚠️  Google OAuth not configured (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET not set)');
-}
-
-// Auth Routes (Only if Google OAuth is configured)
-if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
-    app.get('/api/auth/google',
-        passport.authenticate('google', { scope: ['profile', 'email'] }));
-
-    app.get('/api/auth/google/callback',
-        passport.authenticate('google', { failureRedirect: `${FRONTEND_URL}/login?error=access_denied` }),
-        (req, res) => {
-            if (!req.user) {
-                return res.redirect(`${FRONTEND_URL}/login?error=access_denied`);
-            }
-            const user = req.user;
-            const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
-            const avatar = user.avatar_url || '';
-            const role = user.role || 'user';
-            const isActive = user.is_active !== false; // Default true if undefined (old users)
-            res.redirect(`${FRONTEND_URL}/login?token=${token}&username=${encodeURIComponent(user.username)}&image=${encodeURIComponent(avatar)}&role=${encodeURIComponent(role)}&setup_required=${!isActive}`);
-        });
-}
-
-// Complete setup for authenticated users (e.g. from Google login)
-app.post('/api/auth/complete-setup', authenticateToken, async (req, res) => {
-    const { password } = req.body;
-    if (!password || password.length < 6) return res.status(400).send('Password must be at least 6 characters');
-
-    try {
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        const { error } = await supabase
-            .from('users')
-            .update({
-                password: hashedPassword,
-                setup_token: null,
-                is_active: true,
-                email_verified: true
-            })
-            .eq('id', req.user.id);
-
-        if (error) throw error;
-
-        res.send('Account setup completed');
-    } catch (e) {
-        console.error(e);
-        res.status(500).send('Error completing setup');
-    }
-});
-
-// Login (Only for existing users)
+// Auth Routes
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     try {
-        const { data: user, error } = await supabase
+        const { data, error } = await supabase.auth.signInWithPassword({
+            email,
+            password,
+        });
+
+        if (error) return res.status(401).send(error.message);
+
+        // Fetch user role details
+        const { data: dbUser, error: dbError } = await supabase
             .from('users')
             .select('*')
             .eq('email', email)
             .single();
-
-        if (error || !user) {
-            return res.status(400).send('Invalid credentials');
+        
+        if (dbError || !dbUser) {
+             return res.status(403).send('User not found in system record.');
         }
 
-        // Check if user is active (has set password)
-        if (user.is_active === false) {
-             return res.status(403).send('Account not activated. Please check your email.');
-        }
-
-        if (!user.password || !(await bcrypt.compare(password, user.password))) {
-            return res.status(400).send('Invalid credentials');
-        }
-
-        const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
-        res.json({ token, username: user.username, role: user.role });
+        res.json({
+            token: data.session.access_token,
+            username: dbUser.username,
+            role: dbUser.role,
+            image: data.user.user_metadata?.avatar_url || ''
+        });
     } catch (e) {
         console.error('Login error:', e);
-        res.status(500).send('Login error');
+        res.status(500).send('Internal Server Error');
     }
 });
 
 app.post('/api/auth/set-password', async (req, res) => {
     const { token, password } = req.body;
-    if (!token || !password || password.length < 6) return res.status(400).send('Invalid request');
+    if (!token || !password) return res.status(400).send('Token and password required');
 
     try {
-        // Find user by token
-        const { data: user, error: fetchError } = await supabase
+        // 1. Find invite in public.users
+        const { data: dbUser, error } = await supabase
             .from('users')
             .select('*')
             .eq('setup_token', token)
             .single();
 
-        if (fetchError || !user) {
-            return res.status(400).send('Invalid or expired token');
+        if (error || !dbUser) return res.status(404).send('Invalid or expired token');
+
+        if (!supabaseAdmin) {
+            return res.status(500).send('Server misconfiguration: Missing Service Role Key');
         }
 
-        const hashedPassword = await bcrypt.hash(password, 10);
+        // 2. Create Supabase Auth User OR Update existing
+        let authUser;
+        
+        try {
+            const { data, error } = await supabaseAdmin.auth.admin.createUser({
+                email: dbUser.email,
+                password: password,
+                email_confirm: true,
+                user_metadata: { username: dbUser.username }
+            });
+            
+            if (error) throw error;
+            authUser = data.user;
+        } catch (err) {
+            // If user exists, find them and update password
+            if (err.message?.includes('already registered') || err.code === 'email_exists' || err.status === 422) {
+                 console.log('User exists, updating password...');
+                 // 2a. Find existing user ID
+                 // listUsers is the only way to search by email in admin api without getUserById
+                 // Alternatively, if we trust the email is unique... 
+                 // We can't use getUserByEmail directly in admin-js sometimes, let's use listUsers
+                 const { data: { users }, error: searchError } = await supabaseAdmin.auth.admin.listUsers();
+                 if (searchError) throw searchError;
+                 
+                 const existingAuthUser = users.find(u => u.email === dbUser.email);
+                 if (!existingAuthUser) throw new Error('User reported existing but not found');
+                 
+                 // 2b. Update password
+                 const { data: updatedUser, error: updateError } = await supabaseAdmin.auth.admin.updateUserById(
+                    existingAuthUser.id,
+                    { password: password, email_confirm: true }
+                 );
+                 if (updateError) throw updateError;
+                 authUser = updatedUser.user;
+            } else {
+                throw err;
+            }
+        }
 
-        const { error: updateError } = await supabase
+        // 3. Link public.users
+        // Check if the AUTH ID already exists in public.users (Collision check)
+        const { data: existingPublicUser } = await supabase
             .from('users')
-            .update({
-                password: hashedPassword,
-                setup_token: null, // Clear token
+            .select('id')
+            .eq('id', authUser.id)
+            .single();
+
+        if (existingPublicUser) {
+            // User already has a real public record. 
+            // Update it with info from invitation and delete the temporary invitation row
+             await supabase.from('users').update({
+                username: dbUser.username,
+                role: dbUser.role,
                 is_active: true,
-                email_verified: true
-            })
-            .eq('id', user.id);
+                setup_token: null
+             }).eq('id', authUser.id);
 
-        if (updateError) throw updateError;
+             // Delete the invitation/temp row
+             await supabase.from('users').delete().eq('id', dbUser.id);
+        } else {
+            // SWAP IDs: Delete old placeholder row and insert new one with correct ID
+            await supabase.from('users').delete().eq('id', dbUser.id);
 
-        res.send('Password set successfully');
+            const { error: insertError } = await supabase.from('users').insert({
+                id: authUser.id,
+                email: dbUser.email,
+                username: dbUser.username,
+                role: dbUser.role,
+                created_at: dbUser.created_at,
+                is_active: true,
+                setup_token: null
+            });
+            if (insertError) throw insertError;
+        }
+
+        res.json({ message: 'Password set successfully' });
     } catch (e) {
-        console.error(e);
+        console.error('Set password error:', e);
         res.status(500).send('Error setting password');
     }
 });
 
-app.post('/api/auth/forgot-password', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).send('Email required');
-
-    try {
-        const { data: user, error } = await supabase
-            .from('users')
-            .select('*')
-            .eq('email', email)
-            .single();
-
-        if (error || !user) {
-            // Security: Don't reveal if user exists
-            return res.status(200).send('If the email exists, a reset link has been sent.');
+app.post('/api/auth/complete-setup', authenticateToken, async (req, res) => {
+     const { password } = req.body;
+     try {
+        if (!supabaseAdmin) {
+             return res.status(500).send('Server misconfiguration: Missing Service Role Key');
         }
 
-        // Generate reset token
-        const resetToken = require('crypto').randomBytes(32).toString('hex');
+        // Authenticated user wants to set password (e.g. Google user adding password)
+        const { error } = await supabaseAdmin.auth.admin.updateUserById(
+            req.user.id, // This comes from authenticateToken (public.users id)
+                         // Ideally matches Auth ID. If login was via Google, it DOES match.
+            { password }
+        );
+
+        if (error) throw error;
         
-        // Update user with reset token
-        await supabase
-            .from('users')
-            .update({ setup_token: resetToken })
-            .eq('id', user.id);
+        // Also clear setup_token/activate if needed
+        await supabase.from('users').update({ 
+            setup_token: null,
+            is_active: true 
+        }).eq('id', req.user.id);
 
-        // Send Email
-        const resetLink = `${FRONTEND_URL}/set-password?token=${resetToken}`;
-        await sendResetPasswordEmail(email, resetLink);
-
-        res.send('Reset link sent');
-    } catch (e) {
-        console.error(e);
-        res.status(500).send('Error requesting password reset');
-    }
+        res.json({ message: 'Password updated successfully' });
+     } catch(e) {
+         console.error('Error completing setup:', e);
+         res.status(500).send('Error updating password');
+     }
 });
+
+
+
+
+app.get('/api/auth/me', authenticateToken, (req, res) => {
+    // Return the user data attached by authenticateToken (from public.users)
+    res.json(req.user);
+});
+
+// Middleware to check admin role
+const isAdmin = async (req, res, next) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).send('Admin access required');
+    }
+    next();
+};
 
 // Admin Routes: User Management
 app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
@@ -340,9 +285,10 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
             return res.status(400).send('Email already exists');
         }
 
-        // Generate temporary setup token
         const setupToken = require('crypto').randomBytes(32).toString('hex');
         
+        // Just create the user in public.users. 
+        // Real Auth user will be created when they login via Google.
         const { data: newUser, error: insertError } = await supabase
             .from('users')
             .insert({
@@ -350,7 +296,7 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
                 username,
                 role: role || 'user',
                 created_at: new Date().toISOString(),
-                is_active: false, // User hasn't set password yet
+                is_active: false,
                 setup_token: setupToken
             })
             .select();
@@ -394,7 +340,6 @@ app.post('/api/documents', authenticateToken, upload.single('file'), async (req,
             return res.status(400).send('No file uploaded');
         }
 
-        // Sanitize filename to ASCII only for compatibility
         const originalName = req.file.originalname;
         const sanitizedFilename = originalName.replace(/[^\x00-\x7F]/g, "_");
 
@@ -408,7 +353,7 @@ app.post('/api/documents', authenticateToken, upload.single('file'), async (req,
             original_filename: originalName,
             size: req.file.size,
             chunk_count: result.chunks,
-            vector_ids: result.vectorIds || [], // Store vector IDs as JSONB
+            vector_ids: result.vectorIds || [], 
             uploaded_at: new Date().toISOString()
         });
 
@@ -446,7 +391,6 @@ app.post('/api/documents/batch-delete', authenticateToken, async (req, res) => {
     }
 
     try {
-        // 1. Fetch documents to get Vector IDs
         const { data: docs, error: fetchError } = await supabase
             .from('documents')
             .select('id, vector_ids')
@@ -466,12 +410,10 @@ app.post('/api/documents/batch-delete', authenticateToken, async (req, res) => {
             }
         });
 
-        // 2. Delete from Pinecone
         if (vectorIdsToDelete.length > 0) {
             await ragService.deleteDocument(vectorIdsToDelete);
         }
 
-        // 3. Delete from Supabase
         const { error: deleteError } = await supabase
             .from('documents')
             .delete()
@@ -502,12 +444,10 @@ app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
             return res.status(403).send('Unauthorized');
         }
 
-        // Delete from Pinecone
         if (doc.vector_ids && doc.vector_ids.length > 0) {
             await ragService.deleteDocument(doc.vector_ids);
         }
 
-        // Delete from Supabase
         const { error: deleteError } = await supabase
             .from('documents')
             .delete()
@@ -697,42 +637,6 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                     if (context) {
                         systemPrompt = `Eres un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. Tu objetivo es recomendar la mejor herramienta basándote ÚNICAMENTE en el contexto proporcionado.
                                         
-                                        INSTRUCCIONES DE FORMATO ESTRICTAS:
-                                        Debes responder SIEMPRE siguiendo esta estructura y formato exactos.
-
-                                        [Párrafo introductorio directo y profesional]
-
-                                        ### Opciones Recomendadas
-
-                                        1. **[Nombre de la Herramienta]**
-                                        - **Uso:** [Descripción breve]
-                                        - **Enganche:** [Tipo]
-                                        - **Consumo:** [W]
-                                        - **Ideal para:** [Caso de uso específico]
-
-                                        ... (repite para cada opción)
-
-                                        ### Factores a Considerar
-                                        - **[Factor Clave]:** [Comparativa breve]
-
-                                        SI TIENES CLARO CUÁL ES LA MEJOR OPCIÓN:
-                                        ### Conclusión
-                                        [Recomendación definitiva]
-
-                                        SI DEPENDE DE DATOS QUE NO TIENES (ej. tipo de pared, grosor):
-                                        ### Recomendación
-                                        [Explica los casos: "Si es hormigón usa X, si es yeso usa Y"]
-
-                                        ### Preguntas Clave
-                                        [Pregunta lo que falta: "¿Qué tipo de pared es?", "¿Qué diámetro necesitas?"]
-
-                                        REGLAS:
-                                        - Usa "1. **Nombre**" para títulos.
-                                        - Usa "- **Clave:**" para características.
-                                        - Solo pon "Conclusión" si es una respuesta definitiva. Si no, usa "Recomendación" condicional y pregunta.
-                                        - Mantén el idioma Español.
-                                        - Cíñete al contexto.
-
                                         Contexto de documentos subidos:
                                         ${context}`;
                     }
@@ -799,9 +703,8 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
         res.json({
             userMessage: savedUserMsg,
             aiMessage: savedAiMsg,
-            newTitle
+            newTitle 
         });
-
     } catch (e) {
         console.error(e);
         res.status(500).send('Error sending message');
