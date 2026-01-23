@@ -267,6 +267,76 @@ app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
     }
 });
 
+app.get('/api/admin/analytics', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        const isoDate = thirtyDaysAgo.toISOString();
+
+        // 1. Fetch data
+        const { data: messages, error: msgError } = await supabaseAdmin
+            .from('messages')
+            .select('timestamp')
+            .gte('timestamp', isoDate);
+            
+        const { data: threads, error: threadsError } = await supabaseAdmin
+            .from('threads')
+            .select('created_at')
+            .gte('created_at', isoDate);
+            
+        const { data: users, error: usersError } = await supabaseAdmin
+            .from('users')
+            .select('created_at, role');
+
+        if (msgError || threadsError || usersError) throw new Error('Error fetching raw data');
+
+        // 2. Aggregate Data Helper
+        const groupByDate = (items, dateKey) => {
+            const groups = {};
+            items.forEach(item => {
+                const date = new Date(item[dateKey]).toLocaleDateString();
+                groups[date] = (groups[date] || 0) + 1;
+            });
+            return groups;
+        };
+
+        // 3. Process
+        const messageStats = groupByDate(messages, 'timestamp');
+        const threadStats = groupByDate(threads, 'created_at');
+        
+        // Generate last 30 days labels to ensure continuity
+        const dates = [];
+        for (let i = 29; i >= 0; i--) {
+            const d = new Date();
+            d.setDate(d.getDate() - i);
+            dates.push(d.toLocaleDateString());
+        }
+
+        const chartData = {
+            labels: dates,
+            messages: dates.map(d => messageStats[d] || 0),
+            threads: dates.map(d => threadStats[d] || 0)
+        };
+        
+        const userDistribution = {
+            admins: users.filter(u => u.role === 'admin').length,
+            users: users.filter(u => u.role === 'user').length
+        };
+
+        res.json({
+            chartData,
+            userDistribution,
+            totalMessages: messages.length,
+            totalThreads: threads.length,
+            totalUsers: users.length
+        });
+
+    } catch (e) {
+        console.error('Error in analytics:', e);
+        res.status(500).send('Error generating analytics');
+    }
+});
+
 const { sendWelcomeEmail, sendResetPasswordEmail } = require('./emailService');
 
 app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
