@@ -717,21 +717,54 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                     .eq('thread_id', threadId)
                     .order('timestamp', { ascending: true });
 
-                // RAG: Query Context
-                let systemPrompt = `You are a helpful assistant helping a user with their uploaded documents.`;
+                // DATABASE CONTEXT: Query Machinery Table
+                let systemPrompt = `Eres Sonar, un asistente experto en maquinaria y herramientas de construcción de la empresa NAR.`;
                 
                 try {
-                    console.log(`DEBUG: Querying RAG for user ${req.user.id}`);
-                    const context = await ragService.queryContext(content, req.user.id, req.user.role);
+                    console.log(`DEBUG: Fetching Machinery Context for AI`);
                     
-                    if (context) {
-                        systemPrompt = `Eres Sonar, un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. Tu objetivo es recomendar la mejor herramienta basándote ÚNICAMENTE en el contexto proporcionado.
-                                        
-                                        Contexto de documentos subidos:
-                                        ${context}`;
+                    // Fetch all machinery with categories
+                    const { data: machines, error } = await supabaseAdmin
+                        .from('machinery')
+                        .select(`
+                            model,
+                            description,
+                            specs,
+                            power_consumption_watts,
+                            power_consumption_text,
+                            categories ( name )
+                        `);
+                    
+                    if (error) throw error;
+
+                    if (machines && machines.length > 0) {
+                        // Format context
+                        const contextString = machines.map(m => {
+                            const cat = m.categories?.name || 'General';
+                            const specs = m.specs ? JSON.stringify(m.specs) : '';
+                            const power = m.power_consumption_watts ? `${m.power_consumption_watts}W` : m.power_consumption_text;
+                            return `[${cat}] Modelo: ${m.model} | Desc: ${m.description} | Potencia: ${power} | Specs: ${specs}`;
+                        }).join('\n');
+
+                        systemPrompt = `Eres Sonar, un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. 
+                        
+TU ÚNICA FUENTE DE INFORMACIÓN ES EL SIGUIENTE CATÁLOGO DE MAQUINARIA. NO USES INFORMACIÓN EXTERNA.
+SI LA MÁQUINA NO ESTÁ EN ESTA LISTA, DI QUE NO DISPONES DE INFORMACIÓN SOBRE ELLA.
+
+CATÁLOGO DE MAQUINARIA NAR:
+${contextString}
+
+Instrucciones:
+1. Recomienda la mejor herramienta para la tarea del usuario basándote en el catálogo.
+2. Si preguntan por una máquina específica, da sus detalles técnicos exactos del catálogo.
+3. Sé breve y profesional.`;
+                    } else {
+                        console.warn('No machinery found in DB');
+                        systemPrompt += ` Actualmente no tengo acceso al catálogo de maquinaria.`;
                     }
-                } catch (ragError) {
-                    console.error('DEBUG: RAG Error:', ragError);
+                } catch (dbError) {
+                    console.error('DEBUG: DB Context Error:', dbError);
+                    systemPrompt += ` Hubo un error al recuperar el catálogo.`;
                 }
 
                 const messages = [
