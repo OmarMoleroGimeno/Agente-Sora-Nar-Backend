@@ -11,7 +11,17 @@ require('dotenv').config();
 const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+console.log('Configuring CORS for origin:', FRONTEND_URL);
+
+app.use(cors({
+    origin: FRONTEND_URL,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 app.use(express.static('public'));
 
@@ -30,9 +40,6 @@ app.use((req, res, next) => {
 });
 
 app.get('/ping', (req, res) => res.send('pong'));
-
-const PORT = process.env.PORT || 3000;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
 // Middleware to authenticate token using Supabase Auth
 const authenticateToken = async (req, res, next) => {
