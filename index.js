@@ -57,7 +57,8 @@ const authenticateToken = async (req, res, next) => {
         }
 
         // 2. Fetch user from our public.users table to get Role
-        const { data: dbUser, error: dbError } = await supabase
+        // Use supabaseAdmin to bypass RLS
+        const { data: dbUser, error: dbError } = await supabaseAdmin
             .from('users')
             .select('*')
             .eq('email', user.email)
@@ -69,6 +70,7 @@ const authenticateToken = async (req, res, next) => {
         }
 
         req.user = dbUser; // Attach our DB user (with role)
+        console.log('DEBUG: Auth Success, attached user:', req.user?.email, req.user?.id);
         next();
     } catch (err) {
         console.error('Auth Error:', err.message);
@@ -88,7 +90,7 @@ app.post('/api/auth/login', async (req, res) => {
         if (error) return res.status(401).send(error.message);
 
         // Fetch user role details
-        const { data: dbUser, error: dbError } = await supabase
+        const { data: dbUser, error: dbError } = await supabaseAdmin
             .from('users')
             .select('*')
             .eq('email', email)
@@ -169,7 +171,7 @@ app.post('/api/auth/set-password', async (req, res) => {
 
         // 3. Link public.users
         // Check if the AUTH ID already exists in public.users (Collision check)
-        const { data: existingPublicUser } = await supabase
+        const { data: existingPublicUser } = await supabaseAdmin
             .from('users')
             .select('id')
             .eq('id', authUser.id)
@@ -258,7 +260,7 @@ const isAdmin = async (req, res, next) => {
 // Admin Routes: User Management
 app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
     try {
-        const { data: users, error } = await supabase.from('users').select('*');
+        const { data: users, error } = await supabaseAdmin.from('users').select('*');
 
         if (error) throw error;
         
@@ -352,7 +354,7 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
 
     try {
         // Check if email already exists
-        const { data: existingUser, error: checkError } = await supabase
+        const { data: existingUser, error: checkError } = await supabaseAdmin
             .from('users')
             .select('id')
             .eq('email', email)
@@ -366,7 +368,7 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
         
         // Just create the user in public.users. 
         // Real Auth user will be created when they login via Google.
-        const { data: newUser, error: insertError } = await supabase
+        const { data: newUser, error: insertError } = await supabaseAdmin
             .from('users')
             .insert({
                 email,
@@ -396,7 +398,7 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
 
 app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
     try {
-        const { error } = await supabase
+        const { error } = await supabaseAdmin
             .from('users')
             .delete()
             .eq('id', req.params.id);
@@ -561,7 +563,7 @@ app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
 
 app.get('/api/threads', authenticateToken, async (req, res) => {
     try {
-        const { data: threads, error } = await supabase
+        const { data: threads, error } = await supabaseAdmin
             .from('threads')
             .select('*')
             .eq('user_id', req.user.id)
@@ -576,12 +578,14 @@ app.get('/api/threads', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/threads', authenticateToken, async (req, res) => {
-    const id = req.body.id || require('crypto').randomUUID();
-    const title = req.body.title || 'New Chat';
+    console.log('DEBUG: POST /threads handler reached. User:', req.user?.id, 'Body:', req.body);
+    const body = req.body || {};
+    const id = body.id || require('crypto').randomUUID();
+    const title = body.title || 'New Chat';
     const timestamp = new Date().toISOString();
 
     try {
-        const { error } = await supabase.from('threads').insert({
+        const { error } = await supabaseAdmin.from('threads').insert({
             id,
             user_id: req.user.id,
             title,
@@ -593,14 +597,14 @@ app.post('/api/threads', authenticateToken, async (req, res) => {
         res.json({ id, title, created_at: timestamp });
     } catch (e) {
         console.error('Error creating thread:', e);
-        res.status(500).send('Error creating thread');
+        res.status(500).send('Error creating thread: ' + e.message);
     }
 });
 
 app.put('/api/threads/:id', authenticateToken, async (req, res) => {
     const { title } = req.body;
     try {
-        const { data: thread, error: fetchError } = await supabase
+        const { data: thread, error: fetchError } = await supabaseAdmin
             .from('threads')
             .select('user_id')
             .eq('id', req.params.id)
@@ -609,7 +613,7 @@ app.put('/api/threads/:id', authenticateToken, async (req, res) => {
         if (fetchError || !thread) return res.status(404).send('Thread not found');
         if (thread.user_id !== req.user.id) return res.status(403).send('Unauthorized');
 
-        const { error: updateError } = await supabase
+        const { error: updateError } = await supabaseAdmin
             .from('threads')
             .update({ title })
             .eq('id', req.params.id);
@@ -625,7 +629,7 @@ app.put('/api/threads/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/threads/:id', authenticateToken, async (req, res) => {
     try {
-        const { data: thread, error: fetchError } = await supabase
+        const { data: thread, error: fetchError } = await supabaseAdmin
             .from('threads')
             .select('user_id')
             .eq('id', req.params.id)
@@ -634,7 +638,7 @@ app.delete('/api/threads/:id', authenticateToken, async (req, res) => {
         if (fetchError || !thread) return res.status(404).send('Thread not found');
         if (thread.user_id !== req.user.id) return res.status(403).send('Unauthorized');
 
-        const { error: deleteError } = await supabase
+        const { error: deleteError } = await supabaseAdmin
             .from('threads')
             .delete()
             .eq('id', req.params.id);
@@ -681,7 +685,8 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
 
     try {
         // Check thread ownership
-        const { data: thread, error: fetchError } = await supabase
+        // Use supabaseAdmin to bypass RLS since we verify ownership manually
+        const { data: thread, error: fetchError } = await supabaseAdmin
             .from('threads')
             .select('user_id, title')
             .eq('id', threadId)
@@ -696,7 +701,7 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
 
         // Save user message
         const userMsgTimestamp = new Date().toISOString();
-        const { data: savedUserMsg, error: userMsgError } = await supabase
+        const { data: savedUserMsg, error: userMsgError } = await supabaseAdmin
             .from('messages')
             .insert({
                 thread_id: threadId,
@@ -718,7 +723,7 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
                 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
                 // Fetch History
-                const { data: history, error: historyError } = await supabase
+                const { data: history, error: historyError } = await supabaseAdmin
                     .from('messages')
                     .select('role, content')
                     .eq('thread_id', threadId)
@@ -797,7 +802,7 @@ Instrucciones:
 
         // Save AI message to Supabase
         const aiMsgTimestamp = new Date().toISOString();
-        const { data: savedAiMsg, error: aiMsgError } = await supabase
+        const { data: savedAiMsg, error: aiMsgError } = await supabaseAdmin
             .from('messages')
             .insert({
                 thread_id: threadId,
@@ -823,7 +828,7 @@ Instrucciones:
                     model: process.env.OPENAI_MODEL || 'gpt-4o',
                 });
                 newTitle = titleCompletion.choices[0].message.content.trim();
-                await supabase
+                await supabaseAdmin
                     .from('threads')
                     .update({ title: newTitle })
                     .eq('id', threadId);
@@ -836,8 +841,8 @@ Instrucciones:
             newTitle 
         });
     } catch (e) {
-        console.error(e);
-        res.status(500).send('Error sending message');
+        console.error('SERVER MESSAGE ERROR:', e);
+        res.status(500).send('Error sending message: ' + e.message);
     }
 });
 
