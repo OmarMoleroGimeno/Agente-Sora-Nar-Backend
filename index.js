@@ -654,7 +654,7 @@ app.delete('/api/threads/:id', authenticateToken, async (req, res) => {
 
 app.get('/api/threads/:id/messages', authenticateToken, async (req, res) => {
     try {
-        const { data: thread, error: fetchError } = await supabase
+        const { data: thread, error: fetchError } = await supabaseAdmin
             .from('threads')
             .select('user_id')
             .eq('id', req.params.id)
@@ -663,7 +663,7 @@ app.get('/api/threads/:id/messages', authenticateToken, async (req, res) => {
         if (fetchError || !thread) return res.status(404).send('Thread not found');
         if (thread.user_id !== req.user.id) return res.status(403).send('Unauthorized');
 
-        const { data: messages, error: msgError } = await supabase
+        const { data: messages, error: msgError } = await supabaseAdmin
             .from('messages')
             .select('*')
             .eq('thread_id', req.params.id)
@@ -760,16 +760,48 @@ app.post('/api/threads/:id/messages', authenticateToken, async (req, res) => {
 
                         systemPrompt = `Eres Sonar, un asistente experto en maquinaria y herramientas de construcción de la empresa NAR. 
                         
-TU ÚNICA FUENTE DE INFORMACIÓN ES EL SIGUIENTE CATÁLOGO DE MAQUINARIA. NO USES INFORMACIÓN EXTERNA.
-SI LA MÁQUINA NO ESTÁ EN ESTA LISTA, DI QUE NO DISPONES DE INFORMACIÓN SOBRE ELLA.
+                                        TU ÚNICA FUENTE DE INFORMACIÓN ES EL SIGUIENTE CATÁLOGO DE MAQUINARIA. NO USES INFORMACIÓN EXTERNA.
+                                        SI LA MÁQUINA NO ESTÁ EN ESTA LISTA, DI QUE NO DISPONES DE INFORMACIÓN SOBRE ELLA.
 
-CATÁLOGO DE MAQUINARIA NAR:
-${contextString}
+                                        CATÁLOGO DE MAQUINARIA NAR:
+                                        ${contextString}
 
-Instrucciones:
-1. Recomienda la mejor herramienta para la tarea del usuario basándote en el catálogo.
-2. Si preguntan por una máquina específica, da sus detalles técnicos exactos del catálogo.
-3. Sé breve y profesional.`;
+                                        INSTRUCCIONES DE FORMATO ESTRICTAS:
+                                        Debes responder SIEMPRE siguiendo esta estructura y formato exactos.
+
+                                        [Párrafo introductorio directo y profesional]
+
+                                        ### Opciones Recomendadas
+
+                                        1. **Nombre de la Herramienta**
+                                        - **Uso:** [Descripción breve]
+                                        - **Enganche:** [Tipo]
+                                        - **Consumo:** [W]
+                                        - **Ideal para:** [Caso de uso específico]
+
+                                        ... (repite para cada opción)
+
+                                        ### Factores a Considerar
+                                        - **[Factor Clave]:** [Comparativa breve]
+
+                                        SI TIENES CLARO CUÁL ES LA MEJOR OPCIÓN:
+                                        ### Conclusión
+                                        [Recomendación definitiva]
+
+                                        SI DEPENDE DE DATOS QUE NO TIENES (ej. tipo de pared, grosor):
+                                        ### Recomendación
+                                        [Explica los casos: "Si es hormigón usa X, si es yeso usa Y"]
+
+                                        ### Preguntas Clave
+                                        [Pregunta lo que falta: "¿Qué tipo de pared es?", "¿Qué diámetro necesitas?"]
+
+                                        REGLAS:
+                                        - Usa "1. **Nombre**" para títulos.
+                                        - Usa "- **Clave:**" para características.
+                                        - Solo pon "Conclusión" si es una respuesta definitiva. Si no, usa "Recomendación" condicional y pregunta.
+                                        - Mantén el idioma Español.
+                                        - Cíñete al contexto.`;
+
                     } else {
                         console.warn('No machinery found in DB');
                         systemPrompt += ` Actualmente no tengo acceso al catálogo de maquinaria.`;
