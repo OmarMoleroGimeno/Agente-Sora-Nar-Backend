@@ -1,10 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
 const { supabase, supabaseAdmin } = require('./supabase');
 const OpenAI = require('openai');
 const multer = require('multer');
-const ragService = require('./rag');
 require('dotenv').config();
 
 // Multer config for memory storage
@@ -30,9 +28,6 @@ let openai;
 if (process.env.OPENAI_API_KEY) {
     openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 }
-
-// Initialize RAG Service
-ragService.init();
 
 app.use((req, res, next) => {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
