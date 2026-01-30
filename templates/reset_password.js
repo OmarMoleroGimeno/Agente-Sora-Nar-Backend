@@ -14,7 +14,7 @@ const ResetPasswordTemplate = (link) => `
         <!-- Header with Logo -->
         <div style="background-color: #ffffff; padding: 40px 40px 20px; text-align: center; border-bottom: 1px solid #f0f0f0;">
              <img 
-                src="${process.env.SERVER_URL || 'http://localhost:3000'}/logo-nar.png" 
+                src="${process.env.SERVER_URL}/logo-nar.png" 
                 alt="NAR Valencia"
                 style="margin: 0 auto 20px; width: 80px; height: auto; display: block;"
             />
