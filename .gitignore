@@ -63,6 +63,7 @@ typings/
 
 # Service Account Keys (Firebase/Google Cloud)
 serviceAccountKey.json
+serviceAccountKeyTest.json
 *.pem
 
 # MacOS
