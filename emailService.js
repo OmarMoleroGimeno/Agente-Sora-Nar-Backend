@@ -3,16 +3,31 @@ const nodemailer = require('nodemailer');
 const createTransporter = () => {
     // Configuración para Gmail u otro servicio SMTP
     // Asegúrate de tener estas variables en tu .env
-    if (process.env.SMTP_HOST && process.env.SMTP_USER) {
-        return nodemailer.createTransport({
-            host: process.env.SMTP_HOST,
-            port: process.env.SMTP_PORT || 587,
-            secure: process.env.SMTP_SECURE === 'true', // true para 465, false para otros
+    // Configuración más robusta para SMTP
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASS;
+    const smtpService = process.env.SMTP_SERVICE; // ej: 'gmail'
+    const smtpPort = Number(process.env.SMTP_PORT) || 587;
+    const smtpSecure = process.env.SMTP_SECURE === 'true' || smtpPort === 465;
+
+    if (smtpUser && (smtpHost || smtpService)) {
+        const config = {
             auth: {
-                user: process.env.SMTP_USER,
-                pass: process.env.SMTP_PASS,
-            },
-        });
+                user: smtpUser,
+                pass: smtpPass,
+            }
+        };
+
+        if (smtpService || smtpHost === 'smtp.gmail.com') {
+            config.service = smtpService || 'gmail';
+        } else {
+            config.host = smtpHost;
+            config.port = smtpPort;
+            config.secure = smtpSecure;
+        }
+
+        return nodemailer.createTransport(config);
     } else {
         // Fallback para desarrollo (Ethereal Email) o consola
         console.warn('⚠️ SMTP credentials not found. Using console Mock for emails.');
