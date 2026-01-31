@@ -57,6 +57,16 @@ const { ResetPasswordTemplate } = require('./templates/reset_password');
 const sendWelcomeEmail = async (email, resetLink) => {
     const transporter = createTransporter();
     
+    // Debug connection
+    try {
+        console.log('Testing SMTP Connection (Welcome Email)...');
+        await transporter.verify();
+        console.log('SMTP Connection OK');
+    } catch (verifyError) {
+        console.error('❌ SMTP Connection Failed:', verifyError);
+        // Don't return false yet, let sendMail try and fail with more details or maybe succeed
+    }
+    
     try {
         const htmlContent = WelcomeTemplate(resetLink);
 
